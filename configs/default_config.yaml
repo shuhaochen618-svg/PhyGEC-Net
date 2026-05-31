@@ -1,0 +1,69 @@
+# Default experiment configuration for PhyGEC-Net
+
+data:
+  lookback_hours: 168          # 7 days
+  horizon_hours: 24            # 1 day ahead
+  countries: ['DE', 'DK_1', 'GB_GBN']
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+
+experiment:
+  seeds: [42, 123, 456, 789, 2026]
+  batch_size: 32
+  max_epochs: 20
+  early_stopping_patience: 5
+  num_gpus: 8
+
+phygec_net:
+  d_model: 128
+  n_heads: 4
+  e_layers: 2
+  patch_len: 24
+  stride: 12
+  dropout: 0.15
+  learning_rate: 5.0e-5
+  sparsity_lambda: 0.001
+  ablation_variants:
+    - full                     # All 4 physics modules active
+    - ablate_sign              # w/o Sign-Aware GLU
+    - ablate_period            # w/o Seasonal Prior Fusion
+    - ablate_ramp              # w/o Ramp Decoder
+
+itransformer:
+  d_model: 128
+  n_heads: 4
+  e_layers: 2
+  dropout: 0.15
+  learning_rate: 1.0e-4
+
+timexer:
+  d_model: 128
+  n_heads: 4
+  e_layers: 2
+  patch_len: 24
+  stride: 12
+  dropout: 0.15
+  learning_rate: 1.0e-4
+
+tft:
+  d_model: 128
+  n_heads: 4
+  dropout: 0.15
+  learning_rate: 1.0e-4
+  max_epochs: 30
+
+lightgbm:
+  n_estimators: 500
+  learning_rate: 0.05
+  max_depth: 8
+  num_leaves: 63
+  subsample: 0.8
+  colsample_bytree: 0.8
+
+causal_analysis:
+  method: 'DML'                # Double Machine Learning
+  model_y: 'LassoCV'
+  model_t: 'LassoCV'
+  bandwidths: [0.04, 0.06, 0.10, 0.15]
+  res_percentiles: [9.5, 24.5, 39.4, 54.4]

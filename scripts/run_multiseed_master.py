@@ -1,0 +1,428 @@
+"""
+Master Multi-Seed Experiment Runner
+Orchestrates parallel training across 5 random seeds: 42, 123, 456, 789, 2024
+Allocates 8 GPUs dynamically, aggregates results, and updates plots.
+"""
+import os, sys, json, time, traceback, subprocess
+import numpy as np
+import pandas as pd
+
+ROOT = '/home/csh/myproject'
+sys.path.insert(0, ROOT)
+
+LOG_DIR      = f'{ROOT}/logs'
+RESULTS_DIR  = f'{ROOT}/results'
+FIGURES_DIR  = f'{ROOT}/figures'
+DATA_RAW     = f'{ROOT}/data/raw'
+DATA_PROC    = f'{ROOT}/data/processed'
+
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR, exist_ok=True)
+os.makedirs(FIGURES_DIR, exist_ok=True)
+
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(f'{LOG_DIR}/master.log'),
+        logging.StreamHandler(sys.stdout),
+    ]
+)
+log = logging.getLogger('master')
+
+COUNTRIES = ['DE', 'DK_1', 'GB_GBN']
+MODELS = [
+    'TFT', 'iTransformer', 'TimeXer', 'PhyGEC-Net',
+    'PhyGEC-Net_ablate_sign', 
+    'PhyGEC-Net_ablate_period', 'PhyGEC-Net_ablate_ramp'
+]
+SEEDS = [42, 123, 456, 789, 2026]
+AVAILABLE_GPUS = [0, 1, 2, 3, 4, 5, 6, 7]
+
+def step_status(step_name, status, details=''):
+    msg = f"{'='*60}\n[STEP] {step_name} | {status}\n{details}\n{'='*60}"
+    log.info(msg)
+    with open(f'{LOG_DIR}/status.json', 'w') as f:
+        json.dump({'step': step_name, 'status': status,
+                   'time': time.strftime('%Y-%m-%d %H:%M:%S')}, f)
+
+def phase_data():
+    step_status('Phase 0: Data', 'STARTING')
+    from src.data_processor import download_data, prepare_all_countries
+    raw_csv = os.path.join(DATA_RAW, 'time_series_60min_singleindex.csv')
+    if not os.path.exists(raw_csv):
+        log.info("Downloading OPSD data from server...")
+        download_data(DATA_RAW)
+    else:
+        log.info(f"Raw CSV found: {raw_csv}")
+
+    proc_files = [os.path.join(DATA_PROC, f'{c}_features.parquet') for c in COUNTRIES]
+    if all(os.path.exists(f) for f in proc_files):
+        log.info("Processed files already exist.")
+        datasets = {c: pd.read_parquet(os.path.join(DATA_PROC, f'{c}_features.parquet'))
+                    for c in COUNTRIES}
+    else:
+        datasets = prepare_all_countries(raw_csv, DATA_PROC)
+
+    step_status('Phase 0: Data', 'DONE')
+    return datasets
+
+def phase_lightgbm(datasets):
+    step_status('Phase 1: LightGBM', 'STARTING')
+    from src.data_processor import ML_FEATURE_COLS, TARGET_COL, get_splits
+    from src.metrics import compute_all_metrics, tso_benchmark_metrics
+
+    all_results = {}
+    chk = f'{RESULTS_DIR}/results_checkpoint.json'
+    if os.path.exists(chk):
+        try:
+            with open(chk) as f:
+                all_results = json.load(f)
+        except:
+            pass
+
+    for country in COUNTRIES:
+        log.info(f"\n[LightGBM] Training for {country}...")
+        df = datasets[country]
+        train, val, test = get_splits(df)
+
+        avail = [c for c in ML_FEATURE_COLS if c in df.columns]
+        X_tr, y_tr = train[avail].fillna(0), train[TARGET_COL]
+        X_va, y_va = val[avail].fillna(0),   val[TARGET_COL]
+        X_te, y_te = test[avail].fillna(0),  test[TARGET_COL]
+
+        from src.models.lightgbm_model import LightGBMErrorCorrector
+        model = LightGBMErrorCorrector()
+        model.fit(X_tr, y_tr, X_va, y_va)
+        model.save(f'{RESULTS_DIR}/lgb_{country}.txt')
+
+        pred_te = model.predict(X_te)
+        results, y_true = tso_benchmark_metrics(test, pred_te)
+        results['LightGBM'] = compute_all_metrics(y_true, pred_te)
+
+        if country not in all_results:
+            all_results[country] = {}
+        all_results[country]['LightGBM'] = results['LightGBM']
+        all_results[country]['TSO_Original'] = results['TSO_Original']
+        all_results[country]['Naive_168'] = results['Naive_168']
+
+        pd.DataFrame({'y_true': y_true, 'lgb_pred': pred_te}).to_csv(
+            f'{RESULTS_DIR}/lgb_{country}_preds.csv', index=False)
+
+    with open(chk, 'w') as f:
+        json.dump(all_results, f, indent=2)
+    step_status('Phase 1: LightGBM', 'DONE')
+
+def write_single_dl_script():
+    """Generates a script to run a single DL model for a single country and seed."""
+    script_content = f"""import os, sys, json, torch, importlib, traceback
+import pandas as pd
+import numpy as np
+
+ROOT = '{ROOT}'
+sys.path.insert(0, ROOT)
+
+from src.dataset import ErrorCorrectionDataset
+from src.trainer import DeepTrainer, seed_everything
+from src.metrics import compute_all_metrics, mae, skill_score
+from src.data_processor import get_splits
+
+model_name = sys.argv[1]
+country = sys.argv[2]
+device_id = sys.argv[3]
+seed = int(sys.argv[4]) if len(sys.argv) > 4 else 42
+
+log_dir = f'{{ROOT}}/logs'
+res_dir = f'{{ROOT}}/results'
+os.makedirs(log_dir, exist_ok=True)
+os.makedirs(res_dir, exist_ok=True)
+
+device = torch.device(f'cuda:{{device_id}}' if torch.cuda.is_available() else 'cpu')
+
+DL_CONFIG = {{
+    'seq_len':    168,
+    'pred_len':   24,
+    'batch_size': 32,
+    'max_epochs': 100,
+    'patience':   15,
+    'lr':         1e-4,
+    'weight_decay': 1e-4,
+}}
+
+MODEL_CONFIGS = {{
+    'PhyGEC-Net': {{
+        'DE': {{'d_model': 128, 'n_heads': 4, 'e_layers': 2, 'patch_len': 24, 'stride': 12, 'dropout': 0.15, 'lr': 5e-5, 'weight_decay': 1e-4, 'scale_l1_lambda': 0.001}},
+        'DK_1': {{'d_model': 128, 'n_heads': 4, 'e_layers': 2, 'patch_len': 24, 'stride': 12, 'dropout': 0.15, 'lr': 5e-5, 'weight_decay': 1e-4, 'scale_l1_lambda': 0.001}},
+        'GB_GBN': {{'d_model': 128, 'n_heads': 4, 'e_layers': 2, 'patch_len': 24, 'stride': 12, 'dropout': 0.15, 'lr': 5e-5, 'weight_decay': 1e-4, 'scale_l1_lambda': 0.001}},
+    }},
+    'TimeXer': {{'d_model': 128, 'n_heads': 4, 'e_layers': 2, 'patch_len': 24, 'stride': 12, 'dropout': 0.15}},
+    'iTransformer': {{'d_model': 128, 'n_heads': 4, 'e_layers': 2, 'dropout': 0.15}},
+    'TFT': {{'d_model': 128, 'n_heads': 4, 'dropout': 0.15}},
+}}
+
+model_builders = {{
+    'iTransformer': ('src.models.itransformer', 'build_itransformer'),
+    'TFT':          ('src.models.tft',          'build_tft'),
+    'TimeXer':      ('src.models.timexer',       'build_timexer'),
+    'PhyGEC-Net':   ('src.models.restimexer',    'build_restimexer'),
+    'PhyGEC-Net_ablate_attn': ('src.models.restimexer', 'build_restimexer'),
+    'PhyGEC-Net_ablate_sign': ('src.models.restimexer', 'build_restimexer'),
+    'PhyGEC-Net_ablate_period': ('src.models.restimexer', 'build_restimexer'),
+    'PhyGEC-Net_ablate_ramp': ('src.models.restimexer', 'build_restimexer'),
+}}
+
+try:
+    print(f"Loading data for {{country}}...")
+    df = pd.read_parquet(f'{{ROOT}}/data/processed/{{country}}_features.parquet')
+    train_df, val_df, test_df = get_splits(df)
+
+    train_ds = ErrorCorrectionDataset(train_df, seq_len=DL_CONFIG['seq_len'], pred_len=DL_CONFIG['pred_len'])
+    val_ds   = ErrorCorrectionDataset(val_df,   seq_len=DL_CONFIG['seq_len'], pred_len=DL_CONFIG['pred_len'], scaler_stats=train_ds.scaler_stats)
+    test_ds  = ErrorCorrectionDataset(test_df,  seq_len=DL_CONFIG['seq_len'], pred_len=DL_CONFIG['pred_len'], scaler_stats=train_ds.scaler_stats)
+
+    module_path, builder_fn = model_builders[model_name]
+    mod = importlib.import_module(module_path)
+    builder = getattr(mod, builder_fn)
+    
+    base_model_name = 'PhyGEC-Net' if 'PhyGEC-Net' in model_name else model_name
+    cfg_entry = MODEL_CONFIGS[base_model_name]
+    if isinstance(cfg_entry, dict) and any(c in cfg_entry for c in ['DE', 'DK_1', 'GB_GBN']):
+        model_specific = cfg_entry[country]
+    else:
+        model_specific = cfg_entry
+        
+    model_cfg = {{**DL_CONFIG, **model_specific, 'n_endog': train_ds.n_endog, 'n_exog': train_ds.n_exog, 'n_future': train_ds.n_future}}
+    
+    # Feature index mapping setup
+    model_cfg['feat_to_idx'] = {{
+        'res_pct_lag24': 0,
+        'err_same_hour_lag168': 5,
+        'err_same_hour_lag336': 6,
+        'err_same_hour_lag504': 7,
+        'err_streak': 8,
+        'forecast_ramp': 1,
+        'abs_forecast_ramp': 9
+    }}
+    
+    # Ablation configuration flags
+    if 'ablate_attn' in model_name:
+        model_cfg['ablate_attention'] = True
+    elif 'ablate_sign' in model_name:
+        model_cfg['ablate_sign_gating'] = True
+    elif 'ablate_period' in model_name:
+        model_cfg['ablate_periodicity'] = True
+    elif 'ablate_ramp' in model_name:
+        model_cfg['ablate_ramp_decoder'] = True
+        
+    seed_everything(seed)
+    model = builder(model_cfg)
+
+    trainer = DeepTrainer(model, model_cfg, device=device)
+    trainer.fit(train_ds, val_ds, model_name=f'{{model_name}}_{{country}}_seed{{seed}}', log_dir=log_dir, seed=seed)
+
+    preds, targets = trainer.predict(test_ds, train_ds.scaler_stats)
+    test_mae = mae(targets, preds)
+
+    # Read base TSO mae to compute skill score
+    chk = f'{{res_dir}}/results_checkpoint.json'
+    all_res = {{}}
+    if os.path.exists(chk):
+        try:
+            with open(chk, 'r') as f:
+                all_res = json.load(f)
+        except:
+            pass
+    
+    tso_mae = all_res.get(country, {{}}).get('TSO_Original', {{}}).get('mae')
+    ss = skill_score(test_mae, tso_mae) if tso_mae else None
+
+    # Save run-specific metrics
+    job_metrics = {{
+        'model_name': model_name,
+        'country': country,
+        'seed': seed,
+        'mae': float(test_mae),
+        'rmse': float(np.sqrt(np.mean((targets - preds)**2))),
+        'skill_vs_tso': float(ss) if ss else None,
+    }}
+    with open(f'{{res_dir}}/metrics_{{model_name}}_{{country}}_seed{{seed}}.json', 'w') as f:
+        json.dump(job_metrics, f, indent=2)
+
+    # Save predictions
+    pd.DataFrame({{'y_true': targets.flatten(), 'pred': preds.flatten()}}).to_csv(
+        f'{{res_dir}}/{{model_name}}_{{country}}_seed{{seed}}_preds.csv', index=False)
+    # Save checkpoint
+    torch.save(model.state_dict(), f'{{res_dir}}/{{model_name}}_{{country}}_seed{{seed}}.pt')
+    print(f"SUCCESS: {{model_name}} {{country}} seed {{seed}} MAE={{test_mae:.4f}}")
+
+except Exception as e:
+    print(f"FAILED {{model_name}} {{country}} seed {{seed}}: {{e}}")
+    traceback.print_exc()
+"""
+    script_path = f"{ROOT}/scripts/run_single_dl.py"
+    with open(script_path, 'w') as f:
+        f.write(script_content)
+    return script_path
+
+def phase_deep_learning_parallel():
+    step_status('Phase 2: Deep Learning Multi-Seed (Parallel)', 'STARTING')
+    script_path = write_single_dl_script()
+    
+    jobs = []
+    # Create combinations: (model, country, seed)
+    for seed in SEEDS:
+        for model in MODELS:
+            for country in COUNTRIES:
+                jobs.append((model, country, seed))
+            
+    processes = []
+    
+    log.info(f"Generated {len(jobs)} jobs across {len(SEEDS)} seeds.")
+    
+    # Launch up to len(AVAILABLE_GPUS) jobs at once
+    while jobs or processes:
+        # Check running processes
+        for p, m, c, s, g in list(processes):
+            if p.poll() is not None:
+                log.info(f"Finished: {m} on {c} (seed {s}) (GPU {g})")
+                processes.remove((p, m, c, s, g))
+                AVAILABLE_GPUS.append(g)
+                
+        # Launch new jobs if GPUs are available
+        while jobs and AVAILABLE_GPUS:
+            model, country, seed = jobs.pop(0)
+            gpu = AVAILABLE_GPUS.pop(0)
+            log.info(f"Launching {model} on {country} (seed {seed}) using GPU {gpu}...")
+            
+            log_file = open(f"{LOG_DIR}/{model}_{country}_seed{seed}.log", "w")
+            p = subprocess.Popen([sys.executable, script_path, model, country, str(gpu), str(seed)],
+                                   stdout=log_file, stderr=subprocess.STDOUT)
+            processes.append((p, model, country, seed, gpu))
+            
+        time.sleep(10)
+
+    step_status('Phase 2: Deep Learning Multi-Seed (Parallel)', 'DONE')
+
+def phase_results_aggregation():
+    step_status('Phase 3: Results Aggregation & Average Figures', 'STARTING')
+    
+    chk_path = f'{RESULTS_DIR}/results_checkpoint.json'
+    if os.path.exists(chk_path):
+        with open(chk_path) as f:
+            final_res = json.load(f)
+    else:
+        final_res = {}
+        
+    # Read all metrics_*.json files
+    raw_runs = []
+    for f in os.listdir(RESULTS_DIR):
+        if f.startswith('metrics_') and f.endswith('.json'):
+            try:
+                with open(os.path.join(RESULTS_DIR, f)) as file:
+                    raw_runs.append(json.load(file))
+            except Exception as e:
+                log.error(f"Error reading {f}: {e}")
+                
+    df = pd.DataFrame(raw_runs)
+    if df.empty:
+        log.error("No multi-seed metrics files found!")
+        return
+        
+    # Print individual metrics stats
+    log.info("\n" + "="*80)
+    log.info("MULTI-SEED STATS AGGREGATION")
+    log.info("="*80)
+    
+    # Compute mean and std for each model and country
+    summary_data = []
+    for country in COUNTRIES:
+        if country not in final_res:
+            final_res[country] = {}
+            
+        log.info(f"\n--- {country} ---")
+        # Format a header
+        log.info(f"{'Model':<30} | {'MAE (Mean ± Std)':<20} | {'RMSE (Mean ± Std)':<20} | {'Skill (Mean)':<12}")
+        log.info("-" * 90)
+        
+        for model in MODELS:
+            sub = df[(df['model_name'] == model) & (df['country'] == country)]
+            if len(sub) == 0:
+                continue
+                
+            mean_mae = sub['mae'].mean()
+            std_mae  = sub['mae'].std()
+            mean_rmse = sub['rmse'].mean()
+            std_rmse  = sub['rmse'].std()
+            mean_skill = sub['skill_vs_tso'].mean()
+            
+            log.info(f"{model:<30} | {mean_mae:.4f} ± {std_mae:.4f} | {mean_rmse:.4f} ± {std_rmse:.4f} | {mean_skill:+.2%}")
+            
+            # Store in final_res (override with mean for plotting/reporting)
+            final_res[country][model] = {
+                'mae': float(mean_mae),
+                'rmse': float(mean_rmse),
+                'skill_vs_tso': float(mean_skill) if not pd.isna(mean_skill) else None,
+                'std_mae': float(std_mae) if not pd.isna(std_mae) else 0.0,
+                'std_rmse': float(std_rmse) if not pd.isna(std_rmse) else 0.0,
+            }
+            
+            # Save predictions of seed 42 to the standard name so visualization uses it
+            src_preds = f'{RESULTS_DIR}/{model}_{country}_seed42_preds.csv'
+            dst_preds = f'{RESULTS_DIR}/{model}_{country}_preds.csv'
+            if os.path.exists(src_preds):
+                os.system(f'cp "{src_preds}" "{dst_preds}"')
+            # Save checkpoint of seed 42 to the standard name so extract_mechanisms uses it
+            src_pt = f'{RESULTS_DIR}/{model}_{country}_seed42.pt'
+            dst_pt = f'{RESULTS_DIR}/{model}_{country}.pt'
+            if os.path.exists(src_pt):
+                os.system(f'cp "{src_pt}" "{dst_pt}"')
+                
+        # Also log baselines for comparison
+        for base in ['TSO_Original', 'Naive_168', 'LightGBM']:
+            v = final_res.get(country, {}).get(base, {})
+            mae_val = v.get('mae', 'N/A')
+            rmse_val = v.get('rmse', 'N/A')
+            skill_val = v.get('skill_vs_tso', 0.0)
+            log.info(f"{base:<30} | {mae_val} | {rmse_val} | {skill_val:+.2%}")
+
+    # Write aggregated checkpoint back
+    with open(chk_path, 'w') as f:
+        json.dump(final_res, f, indent=2)
+        
+    # Export full metrics log
+    df.to_csv(f'{RESULTS_DIR}/all_seeds_metrics.csv', index=False)
+    
+    # Generate figures using aggregated results
+    from src.visualize import generate_all_figures
+    try:
+        generate_all_figures(final_res, RESULTS_DIR, FIGURES_DIR)
+        log.log(logging.INFO, "Aggregated figures successfully generated!")
+    except Exception as e:
+        log.error(f"Figure generation failed: {e}")
+
+    # Generate physical mechanisms (permutation importance, DM matrix, attention weights)
+    try:
+        log.log(logging.INFO, "Running extract_mechanisms.py to extract physical attributions...")
+        import subprocess
+        subprocess.run([sys.executable, f'{ROOT}/scripts/extract_mechanisms.py'], check=True)
+        log.log(logging.INFO, "Physical mechanisms successfully extracted!")
+    except Exception as e:
+        log.error(f"Mechanism extraction failed: {e}")
+        
+    step_status('Phase 3: Results Aggregation & Average Figures', 'DONE')
+
+if __name__ == '__main__':
+    log.info("="*80)
+    log.info("TSO FORECAST ERROR CORRECTION - MULTI-SEED PARALLEL PIPELINE")
+    log.info("="*80)
+    
+    t_start = time.time()
+    datasets = phase_data()
+    phase_lightgbm(datasets)
+    phase_deep_learning_parallel()
+    phase_results_aggregation()
+    
+    total = (time.time() - t_start) / 60
+    log.info(f"\nAll multi-seed experiments completed in {total:.1f} minutes.")
+    step_status('PIPELINE', 'COMPLETE', f'Total time: {total:.1f} min')
