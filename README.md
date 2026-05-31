@@ -37,14 +37,15 @@ In addition to superior forecasting accuracy, this work provides rigorous causal
 ## Repository Structure
 
 ```
-code open acess/
+.
 ├── README.md                           # This file
 ├── requirements.txt                    # Python dependencies
 ├── LICENSE                             # MIT License
+├── setup.py                            # Package setup script
 │
 ├── src/                                # Core source code
 │   ├── models/
-│   │   ├── phygec_net.py               # ★ PhyGEC-Net (our proposed model)
+│   │   ├── phygec_net.py               # ★ PhyGEC-Net implementation (RESTimeXer class)
 │   │   ├── itransformer.py             # Baseline: iTransformer
 │   │   ├── timexer.py                  # Baseline: TimeXer
 │   │   ├── tft.py                      # Baseline: Temporal Fusion Transformer
@@ -74,6 +75,8 @@ code open acess/
 └── configs/                            # Experiment configurations
     └── default_config.yaml             # Default hyperparameters
 ```
+
+> **Implementation Note:** The proposed **PhyGEC-Net** model is represented in the source code by the `RESTimeXer` class in [src/models/phygec_net.py](file:///E:/Paper_AI_coding/solar%20and%20wind/code%20open%20acess/src/models/phygec_net.py). It can be dynamically instantiated using the helper function `build_restimexer(config)`.
 
 ## Data
 
