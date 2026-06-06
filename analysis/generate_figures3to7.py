@@ -692,6 +692,10 @@ def generate_figure_7():
         ax_a.fill(angles, vals, color=color, alpha=0.08)
     
     ax_a.set_thetagrids(angles[:-1] * 180/np.pi, categories[:-1], fontsize=5.5, fontweight='semibold')
+    ax_a.set_ylim(0, 0.52)
+    ax_a.set_yticks([0.10, 0.20, 0.30, 0.40, 0.50])
+    ax_a.set_yticklabels(['10%', '20%', '30%', '40%', '50%'], fontsize=5, zorder=10)
+    ax_a.set_rlabel_position(45)
     ax_a.set_ylim(0, y_max * 1.15)
     ax_a.set_yticks([round(y_max * f, 2) for f in [0.3, 0.6, 0.9]])
     ax_a.set_yticklabels([f'{round(y_max * f * 100, 0):.0f}%' for f in [0.3, 0.6, 0.9]], fontsize=5,
