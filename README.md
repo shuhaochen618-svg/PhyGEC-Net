@@ -4,6 +4,8 @@
 [![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+![PhyGEC-Net Framework](Figure1.png)
+
 ## Overview & Academic Background
 
 Modern electric grids are undergoing rapid decarbonization, leading to unprecedented levels of Renewable Energy Sources (RES) penetration. However, the high volatility and weather-dependency of wind and solar power dramatically amplify day-ahead load forecasting errors. Transmission System Operators (TSOs) face major challenges in grid balancing and scheduling due to these amplified deviations.
