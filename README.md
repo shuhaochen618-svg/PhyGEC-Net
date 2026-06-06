@@ -4,7 +4,7 @@
 [![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-![PhyGEC-Net Framework](Figure1.png)
+![PhyGEC-Net Framework](Figure1.png?v=2)
 
 ## Overview & Academic Background
 
